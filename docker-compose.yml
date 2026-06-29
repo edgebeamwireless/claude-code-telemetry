@@ -1,0 +1,49 @@
+services:
+
+# OTel Collector - receives telemetry pushed from Claude Code clients
+# and routes metrics to Prometheus and logs to Loki
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports: ["4317:4317", "4318:4318", "8889:8889"]
+    restart: unless-stopped
+    depends_on: [prometheus, loki]
+
+# Prometheus - scrapes metrics from the OTel Collector and stores them
+# Grafana queries Prometheus to visualize this data
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: 
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports: ["9090:9090"]
+    restart: unless-stopped
+
+# Loki - receives log data pushed from the OTel Collector and stores it
+# Grafana queries Loki to visualize this data
+  loki:
+    image: grafana/loki:latest
+    ports: ["3100:3100"]
+    volumes: 
+      - loki_data:/loki
+    restart: unless-stopped
+
+# Grafana - dashboard UI that queries both Prometheus and Loki
+# to visualize usage, code acceptance rates, and cost
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3000:3000"]
+    volumes:
+       - grafana_data:/var/lib/grafana
+       - ./provisioning/:/etc/grafana/provisioning
+    restart: unless-stopped
+    environment: ["GF_SECURITY_ADMIN_PASSWORD=<from-secrets-manager>"]
+    depends_on: [prometheus, loki]
+
+volumes:
+  prometheus_data:
+  loki_data:
+  grafana_data:
