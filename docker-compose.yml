@@ -3,11 +3,14 @@ services:
 # OTel Collector - receives telemetry pushed from Claude Code clients
 # and routes metrics to Prometheus and logs to Loki
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
+    image: otel/opentelemetry-collector-contrib:0.156.0@sha256:125bdbeb7590cc1952c5b3430ecf14063568980c2c93d5b38676cc0446ed8108
     command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
-    ports: ["4317:4317", "4318:4318", "8889:8889"]
+    # 4317/4318 are the OTLP ingest ports (SG-allowlisted clients). 8889 is the
+    # Prometheus exporter — only Prometheus needs it (via the docker network), so
+    # bind it to loopback for VM-local debugging only.
+    ports: ["4317:4317", "4318:4318", "127.0.0.1:8889:8889"]
     restart: unless-stopped
     # Shared ingest token for OTLP bearer-token auth (see .env / .env.example).
     # :? fails fast so the collector never starts with auth effectively disabled.
@@ -19,39 +22,44 @@ services:
 # Grafana queries Prometheus to visualize this data
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus_data:/prometheus
-    ports: ["9090:9090"]
+    # Only Grafana queries Prometheus (via the docker network); bind to loopback
+    # so 9090 (incl. the admin API) is reachable for VM-local debugging only.
+    ports: ["127.0.0.1:9090:9090"]
     restart: unless-stopped
-    # admin API enables series deletion (9090 is NOT in the SG, so VM-local only).
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --web.enable-admin-api
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=10GB
 
 # Loki - receives log data pushed from the OTel Collector and stores it
 # Grafana queries Loki to visualize this data
   loki:
-    image: grafana/loki:latest
-    ports: ["3100:3100"]
-    volumes: 
+    image: grafana/loki:3.7.3@sha256:70b9f699fc9bb868b62f1cfd4f787dfa50242f1fd92e6089787d5d7daea75fe8
+    # Only the collector (push) and Grafana (query) reach Loki via the docker
+    # network; bind to loopback for VM-local debugging only.
+    ports: ["127.0.0.1:3100:3100"]
+    volumes:
       - loki_data:/loki
     restart: unless-stopped
 
 # Grafana - dashboard UI that queries both Prometheus and Loki
 # to visualize usage, code acceptance rates, and cost
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63
     ports: ["3000:3000"]
     volumes:
        - grafana_data:/var/lib/grafana
        - ./provisioning/:/etc/grafana/provisioning
     restart: unless-stopped
-    # Password comes from the GRAFANA_ADMIN_PASSWORD env var (see .env.example / .env).
+    # :? fails fast if unset — otherwise Grafana silently falls back to admin/admin.
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?set a strong Grafana admin password in .env}
     depends_on: [prometheus, loki]
 
 volumes:

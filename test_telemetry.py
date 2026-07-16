@@ -25,17 +25,20 @@ token_usage = meter.create_counter("claude_code.token.usage", description="Token
 cost_usage = meter.create_counter("claude_code.cost.usage", description="Session cost in USD")
 edit_decision = meter.create_counter("claude_code.code_edit_tool.decision", description="Code edit permission decisions")
 
+# Fake addresses (.invalid is reserved by RFC 2606 and can never resolve) so this
+# synthetic data never impersonates a real employee.
 users = [
-    "brett@edgebeamwireless.com",
-    "joseph@edgebeamwireless.com",
-    "don@edgebeamwireless.com",
-    "huseyin@edgebeamwireless.com",
+    "user1@example.invalid",
+    "user2@example.invalid",
+    "user3@example.invalid",
+    "user4@example.invalid",
 ]
 model = "claude-sonnet-5"
 
 while True:
     user = random.choice(users)
-    base = {"user.email": user, "model": model}
+    # synthetic=true so this generated data is filterable / excludable in queries.
+    base = {"user.email": user, "model": model, "synthetic": "true"}
 
     session_count.add(1, {**base, "start_type": "fresh"})
 
@@ -56,6 +59,7 @@ while True:
             "decision": decision,
             "tool_name": random.choice(["Edit", "Write"]),
             "language": random.choice(["Python", "TypeScript", "YAML"]),
+            "synthetic": "true",
         })
 
     time.sleep(10)
