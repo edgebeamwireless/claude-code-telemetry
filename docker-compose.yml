@@ -6,7 +6,7 @@ services:
     image: otel/opentelemetry-collector-contrib:0.156.0@sha256:125bdbeb7590cc1952c5b3430ecf14063568980c2c93d5b38676cc0446ed8108
     command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:
-      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
     # 4317/4318 are the OTLP ingest ports (SG-allowlisted clients). 8889 (the
     # Prometheus exporter) is scraped by Prometheus over the docker network, so
     # it is NOT published to the host.
@@ -16,6 +16,18 @@ services:
     # :? fails fast so the collector never starts with auth effectively disabled.
     environment:
       - OTEL_INGEST_TOKEN=${OTEL_INGEST_TOKEN:?set OTEL_INGEST_TOKEN in .env}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
     depends_on: [prometheus, loki]
 
 # Prometheus - scrapes metrics from the OTel Collector and stores them
@@ -23,8 +35,9 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
+    user: "nobody"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     # 9090 is queried by Grafana over the docker network and is NOT published to
     # the host. For VM-local debugging use `docker compose exec prometheus ...`.
@@ -35,6 +48,18 @@ services:
       - --web.enable-admin-api
       - --storage.tsdb.retention.time=30d
       - --storage.tsdb.retention.size=10GB
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
 
 # Loki - receives log data pushed from the OTel Collector and stores it
 # Grafana queries Loki to visualize this data
@@ -45,19 +70,44 @@ services:
     volumes:
       - loki_data:/loki
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
 
 # Grafana - dashboard UI that queries both Prometheus and Loki
 # to visualize usage, code acceptance rates, and cost
   grafana:
     image: grafana/grafana:13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63
+    user: "472"
     ports: ["3000:3000"]
     volumes:
        - grafana_data:/var/lib/grafana
-       - ./provisioning/:/etc/grafana/provisioning
+       - ./provisioning/:/etc/grafana/provisioning:ro
     restart: unless-stopped
     # :? fails fast if unset — otherwise Grafana silently falls back to admin/admin.
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?set a strong Grafana admin password in .env}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
     depends_on: [prometheus, loki]
 
 volumes:

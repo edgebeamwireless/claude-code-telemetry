@@ -18,6 +18,12 @@ receivers:
           authenticator: bearertokenauth/otlp
 
 processors:
+  # memory_limiter must be first in the pipeline; it sheds load before the
+  # collector can OOM its 512M container limit.
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 400
+    spike_limit_mib: 100
   batch: {}
 
 exporters:
@@ -40,9 +46,9 @@ service:
   pipelines:
     metrics:
       receivers: [otlp]
-      processors: [batch]
+      processors: [memory_limiter, batch]
       exporters: [prometheus]
     logs:
       receivers: [otlp]
-      processors: [batch]
+      processors: [memory_limiter, batch]
       exporters: [otlp_http/loki]
