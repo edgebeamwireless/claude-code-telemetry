@@ -1,14 +1,23 @@
 #!/bin/bash
-# update-sg.sh — updates AWS security group with current public IP
-# For OPS-235 telemetry VM (ops-claude-code-telemetry)
+# update-sg.sh — reconcile the AWS security group to a desired allowlist.
+# For OPS-235 telemetry VM (ops-claude-code-telemetry).
+#
+# Desired state per port:
+#   - the OPERATOR's current public IP (this machine) on ALL ports
+#   - every entry in team-ips.txt on the TELEMETRY ports only (4317/4318)
+#
+# It reconciles (adds missing / removes stale) rather than wiping and re-adding,
+# so re-running when the operator's cellular IP rotates does NOT evict teammates.
 set -euo pipefail
+
+cd "$(dirname "$0")"
 
 SG_ID="sg-0c10615c3983e2f47"
 REGION="us-east-1"
 PORTS=(22 3000 4317 4318)
+TELEMETRY_PORTS=" 4317 4318 "   # team IPs are allowed on these only
+TEAM_FILE="team-ips.txt"
 
-# Descriptions to attach to the re-created rules, keyed by port.
-# (case statement instead of an associative array for bash 3.2 / macOS compat)
 port_desc() {
     case "$1" in
         22)   echo "SSH access" ;;
@@ -19,47 +28,56 @@ port_desc() {
     esac
 }
 
-# Force IPv4 — ifconfig.me/checkip resolve over IPv6 on dual-stack networks,
-# which would produce a malformed "<ipv6>/32" CIDR.
+# Force IPv4 — checkip resolves over IPv6 on dual-stack networks otherwise.
 MY_IP="$(curl -4 -s https://checkip.amazonaws.com | tr -d '[:space:]')/32"
-
-# Sanity-check we actually got an IPv4 address before touching the SG.
 if ! [[ "$MY_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/32$ ]]; then
     echo "ERROR: could not determine a valid IPv4 address (got '$MY_IP')" >&2
     exit 1
 fi
 
-echo "Current IP: $MY_IP"
-echo "Updating security group: $SG_ID"
+# Emit desired "CIDR<TAB>DESC" lines for a port.
+desired_for_port() {
+    local port="$1"
+    printf '%s\t%s\n' "$MY_IP" "operator: $(port_desc "$port")"
+    if [[ "$TELEMETRY_PORTS" == *" $port "* && -f "$TEAM_FILE" ]]; then
+        # each line: "<ip-or-cidr>  <description...>"; skip blanks/comments.
+        # `|| true`: grep exits 1 when the file is all comments (no matches),
+        # which would otherwise trip `set -e`/pipefail and abort the reconcile.
+        { grep -vE '^[[:space:]]*(#|$)' "$TEAM_FILE" || true; } | while read -r ip desc; do
+            [[ "$ip" == */* ]] || ip="$ip/32"
+            printf '%s\t%s\n' "$ip" "team: ${desc:-teammate}"
+        done
+    fi
+}
+
+echo "Operator IP: $MY_IP"
+echo "Reconciling security group: $SG_ID"
 
 for PORT in "${PORTS[@]}"; do
-    DESC="$(port_desc "$PORT")"
+    DESIRED="$(desired_for_port "$PORT")"
+    DESIRED_CIDRS="$(printf '%s\n' "$DESIRED" | cut -f1 | sort -u)"
 
-    # Remove ALL existing IPv4 rules for this port. We revoke via --ip-permissions
-    # with the exact CidrIp + Description so rules that carry a description are
-    # matched and removed reliably.
-    OLD_RULES="$(aws ec2 describe-security-groups \
-        --group-ids "$SG_ID" --region "$REGION" \
-        --query "SecurityGroups[0].IpPermissions[?FromPort==\`$PORT\`].IpRanges[]" \
-        --output json)"
+    CURRENT_JSON="$(aws ec2 describe-security-groups --group-ids "$SG_ID" --region "$REGION" \
+        --query "SecurityGroups[0].IpPermissions[?FromPort==\`$PORT\`].IpRanges[]" --output json)"
+    CURRENT_CIDRS="$(printf '%s' "$CURRENT_JSON" | jq -r '.[].CidrIp' | sort -u)"
 
-    echo "$OLD_RULES" | jq -c '.[]' | while read -r RANGE; do
-        OLD_IP="$(echo "$RANGE" | jq -r '.CidrIp')"
-        OLD_DESC="$(echo "$RANGE" | jq -r '.Description // ""')"
+    # Revoke rules present but no longer desired (e.g. the operator's old IP).
+    comm -23 <(printf '%s\n' "$CURRENT_CIDRS") <(printf '%s\n' "$DESIRED_CIDRS") | while read -r cidr; do
+        [[ -z "$cidr" ]] && continue
+        d="$(printf '%s' "$CURRENT_JSON" | jq -r --arg c "$cidr" '.[]|select(.CidrIp==$c)|.Description // ""' | head -1)"
         aws ec2 revoke-security-group-ingress --group-id "$SG_ID" --region "$REGION" \
-            --ip-permissions "IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,IpRanges=[{CidrIp=$OLD_IP,Description=\"$OLD_DESC\"}]" \
-            >/dev/null
-        echo "  Removed $OLD_IP (\"$OLD_DESC\") from port $PORT"
+            --ip-permissions "IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,IpRanges=[{CidrIp=$cidr,Description=\"$d\"}]" >/dev/null
+        echo "  [$PORT] revoked $cidr"
     done
 
-    # Add current IP (with description), unless it is already present.
-    if aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --region "$REGION" \
-        --ip-permissions "IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,IpRanges=[{CidrIp=$MY_IP,Description=\"$DESC\"}]" \
-        >/dev/null 2>&1; then
-        echo "  Added $MY_IP (\"$DESC\") to port $PORT"
-    else
-        echo "  $MY_IP already present on port $PORT (skipped)"
-    fi
+    # Authorize desired rules not yet present.
+    comm -13 <(printf '%s\n' "$CURRENT_CIDRS") <(printf '%s\n' "$DESIRED_CIDRS") | while read -r cidr; do
+        [[ -z "$cidr" ]] && continue
+        d="$(printf '%s\n' "$DESIRED" | awk -F'\t' -v c="$cidr" '$1==c{print $2; exit}')"
+        aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --region "$REGION" \
+            --ip-permissions "IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,IpRanges=[{CidrIp=$cidr,Description=\"$d\"}]" >/dev/null
+        echo "  [$PORT] authorized $cidr ($d)"
+    done
 done
 
-echo "Done. All ports updated to $MY_IP"
+echo "Done. Operator on all ports; team-ips.txt entries on 4317/4318."

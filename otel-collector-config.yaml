@@ -1,8 +1,21 @@
+# Shared bearer-token auth for the OTLP receivers. Clients must send
+# `Authorization: Bearer <OTEL_INGEST_TOKEN>` or their push is rejected. The
+# token is read from the OTEL_INGEST_TOKEN env var (passed in via .env).
+extensions:
+  bearertokenauth/otlp:
+    token: ${env:OTEL_INGEST_TOKEN}
+
 receivers:
   otlp:
     protocols:
-      grpc: {endpoint: 0.0.0.0:4317 }
-      http: {endpoint: 0.0.0.0:4318 }
+      grpc:
+        endpoint: 0.0.0.0:4317
+        auth:
+          authenticator: bearertokenauth/otlp
+      http:
+        endpoint: 0.0.0.0:4318
+        auth:
+          authenticator: bearertokenauth/otlp
 
 processors:
   batch: {}
@@ -21,6 +34,7 @@ exporters:
     endpoint: http://loki:3100/otlp
 
 service:
+  extensions: [bearertokenauth/otlp]
   pipelines:
     metrics:
       receivers: [otlp]

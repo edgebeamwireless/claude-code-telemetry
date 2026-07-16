@@ -1,0 +1,15 @@
+# team-ips.txt — teammate IPs allowed to PUSH Claude Code telemetry.
+# Applied by update-sg.sh to the TELEMETRY ports only (4317/4318). Teammates get
+# NO SSH (22) or Grafana (3000) access — telemetry-push only.
+#
+# One entry per line:  <ip-or-cidr>   <description>
+#   - a bare IP is treated as /32
+#   - lines starting with # (and blank lines) are ignored
+#
+# NOTE: this file is committed to git, so entries are visible in history. It is
+# the source of truth for who can push — running update-sg.sh reconciles the SG
+# to exactly (operator's current IP) + (these entries).
+#
+# Example:
+# 203.0.113.5      Alice (home)
+# 198.51.100.0/24  BranchOffice NAT range

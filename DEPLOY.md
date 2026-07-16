@@ -1,94 +1,88 @@
 # Deploying the OPS-235 Telemetry Stack
 
 The stack runs via `docker compose` on the VM (`ubuntu@<VM_PUBLIC_IP>`,
-`~/claude-code-telemetry`). The Grafana admin password is **not** stored in the
-repo — it's injected at deploy time from **Bitwarden Secrets Manager** (`bws`).
+`~/claude-code-telemetry`). Secrets live in a **gitignored `.env`** on the VM,
+never in the repo.
 
 ## Components
 - `docker-compose.yml` — otel-collector, prometheus, loki, grafana
-- `otel-collector-config.yaml` — OTLP in → Prometheus (metrics) + Loki (logs)
+- `otel-collector-config.yaml` — OTLP (bearer-auth) in → Prometheus + Loki
 - `provisioning/` — Grafana datasources + the analytics dashboard
-- `deploy.sh` — pulls secrets from `bws`, then `docker compose up -d`
-- `bootstrap-claude-telemetry.sh` — configures a Claude Code client to emit telemetry
+- `bootstrap-claude-telemetry.sh` — point a Claude Code client at the collector
+- `update-sg.sh` + `team-ips.txt` — manage who can reach the collector
 
----
-
-## 1. One-time: Bitwarden Secrets Manager setup
-
-Done once by someone with access to the Bitwarden org's Secrets Manager.
-
-1. **Create a project** (e.g. `ops-claude-code-telemetry`).
-2. **Add a secret** in that project holding the Grafana admin password:
-   - key: `GF_SECURITY_ADMIN_PASSWORD` (any strong value)
-   - note its **UUID** — this is `GF_ADMIN_SECRET_ID`.
-3. **Create a machine account**, give it **read** access to the project, and
-   generate an **access token** — this is `BWS_ACCESS_TOKEN`.
-
-## 2. One-time on the VM: install tooling
-
-```bash
-# jq is usually present; bws is not. Install the bws binary (Linux x86_64):
-BWS_VER=1.0.0   # pin to the current release
-curl -fsSL -o /tmp/bws.zip \
-  "https://github.com/bitwarden/sdk-sm/releases/download/bws-v${BWS_VER}/bws-x86_64-unknown-linux-gnu-${BWS_VER}.zip"
-unzip -o /tmp/bws.zip -d ~/.local/bin && chmod +x ~/.local/bin/bws
-bws --version
-```
-
-## 3. One-time on the VM: operator config
-
+## Secrets (`.env` on the VM)
 ```bash
 cd ~/claude-code-telemetry
-cp .bws.env.example .bws.env
-chmod 600 .bws.env
-# edit .bws.env, fill in BWS_ACCESS_TOKEN and GF_ADMIN_SECRET_ID
+cp .env.example .env && chmod 600 .env
+# then set:
+#   GRAFANA_ADMIN_PASSWORD=<strong value>
+#   OTEL_INGEST_TOKEN=$(openssl rand -hex 32)   # shared telemetry-push token
 ```
-`.bws.env` is gitignored — it holds the access token and must never be committed.
+`docker-compose.yml` reads `${GRAFANA_ADMIN_PASSWORD}` and requires
+`${OTEL_INGEST_TOKEN:?}` (the collector refuses to start without it, so auth is
+never silently disabled).
 
-## 4. Deploy
+> There is also an optional Bitwarden Secrets Manager path (`deploy.sh` +
+> `.bws.env`) if you'd rather pull secrets from `bws` at deploy time instead of
+> keeping them in `.env`. It expects the var named `GF_SECURITY_ADMIN_PASSWORD`;
+> reconcile that with the `.env` approach before using it.
 
+## Deploy
 ```bash
 cd ~/claude-code-telemetry
 git pull
-./deploy.sh
+docker compose up -d
 ```
-`deploy.sh` reads `.bws.env`, fetches the Grafana password from `bws`, exports it
-as `GF_SECURITY_ADMIN_PASSWORD`, and runs `docker compose up -d`. The compose
-file uses `${GF_SECURITY_ADMIN_PASSWORD:?}`, so a plain `docker compose up`
-without the secret **fails fast** instead of booting with a blank password.
-
-> Grafana applies `GF_SECURITY_ADMIN_PASSWORD` on every start, so each deploy
-> resets the admin password to the current bws value. Rotate the secret in
-> Bitwarden, then re-run `./deploy.sh`.
+Grafana applies `GF_SECURITY_ADMIN_PASSWORD` on every start, so editing `.env`
+and re-running `docker compose up -d` resets the admin password.
 
 ---
 
-## Making Claude Code emit real telemetry
+## Authentication model
+The OTLP receivers (4317/4318) require a **shared bearer token**
+(`OTEL_INGEST_TOKEN`). A push without `Authorization: Bearer <token>` is rejected
+with 401. Network access is additionally gated by the security group (below), so
+a client needs **both** an allowlisted IP **and** the token.
 
-Telemetry is enabled per-client via an `env` block in `~/.claude/settings.json`
-(template: `claude-code-telemetry-settings.json`). To apply it:
+User identity on the dashboard comes from each person's own Claude login
+(`user_email` label) — not from the token — so one shared token still yields
+per-person breakdowns.
 
+## Onboarding a new user (telemetry-push)
+1. **Allowlist their IP.** Add a line to `team-ips.txt`:
+   ```
+   203.0.113.9   Jane (home)
+   ```
+   Commit it, then run `./update-sg.sh` (opens 4317/4318 for that IP only — no
+   SSH/Grafana). Requires a **static** IP; cellular/dynamic IPs won't stay valid.
+2. **Give them the token** (`OTEL_INGEST_TOKEN`) over a secure channel.
+3. **They configure their client** from a clone of this repo:
+   ```bash
+   ./bootstrap-claude-telemetry.sh <OTEL_INGEST_TOKEN> http://<VM_PUBLIC_IP>:4317
+   ```
+   New Claude Code sessions on their machine then export authenticated telemetry.
+
+**Removing a user:** delete their line from `team-ips.txt`, run `./update-sg.sh`.
+To fully cut off everyone at once, rotate `OTEL_INGEST_TOKEN` in `.env` and
+`docker compose up -d`.
+
+## Enabling telemetry on the VM itself
 ```bash
-# On the VM (client + collector on the same host):
-./bootstrap-claude-telemetry.sh
-
-# From a remote machine (e.g. a laptop) — point at the VM and ensure the SG
-# allows your IP on 4317/4318 (use ./update-sg.sh):
-./bootstrap-claude-telemetry.sh http://<VM_PUBLIC_IP>:4317
+./bootstrap-claude-telemetry.sh "$(grep ^OTEL_INGEST_TOKEN= .env | cut -d= -f2)"
 ```
-
-Verify data is arriving:
+(defaults to `http://localhost:4317`). Verify data is arriving:
 ```bash
 curl -s http://localhost:9090/api/v1/label/__name__/values | jq -r '.data[]' | grep claude
 ```
-Metrics take up to ~40s to appear (10s client export interval + 30s Prometheus
-scrape). Set the Grafana dashboard's time range wide enough (e.g. 24h) to cover
-past activity — see STATUS.md for why (per-session series go stale).
+Metrics take up to ~40s to appear (10s client export + 30s Prometheus scrape).
+Set the Grafana time range wide enough (e.g. 24h) — per-session series go stale
+(see STATUS.md).
 
 ## Security-group access
-
-Ports 22/3000/4317/4318 on `sg-0c10615c3983e2f47` are locked to a single
-operator IP, which rotates on cellular. Refresh before connecting:
+`update-sg.sh` reconciles `sg-0c10615c3983e2f47` to exactly: the operator's
+current IP (all ports) + every `team-ips.txt` entry (4317/4318 only). Re-run it
+whenever the operator's cellular IP rotates — it won't evict teammates.
 ```bash
 ./update-sg.sh
 ```

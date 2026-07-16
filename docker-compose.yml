@@ -9,6 +9,10 @@ services:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
     ports: ["4317:4317", "4318:4318", "8889:8889"]
     restart: unless-stopped
+    # Shared ingest token for OTLP bearer-token auth (see .env / .env.example).
+    # :? fails fast so the collector never starts with auth effectively disabled.
+    environment:
+      - OTEL_INGEST_TOKEN=${OTEL_INGEST_TOKEN:?set OTEL_INGEST_TOKEN in .env}
     depends_on: [prometheus, loki]
 
 # Prometheus - scrapes metrics from the OTel Collector and stores them
