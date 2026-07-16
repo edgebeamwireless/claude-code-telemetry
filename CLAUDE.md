@@ -1,89 +1,97 @@
 # Claude Code Telemetry Stack — OPS-235
 
 ## Project Overview
-Self-hosted telemetry collection stack for tracking Claude Code usage across EdgeBeam Wireless. Collects token usage, session counts, estimated cost, and code suggestion acceptance/rejection rates. Data displayed on an auto-provisioned Grafana dashboard.
+Self-hosted telemetry stack tracking Claude Code usage across EdgeBeam Wireless:
+token usage, session counts, cost, and code-edit accept/reject decisions, shown
+on an auto-provisioned Grafana dashboard. Runs entirely on one EC2 VM.
 
 ## Architecture
 ```
-Claude Code clients → OTel Collector (4317 gRPC / 4318 HTTP)
-                          ├── push logs → Loki (:3100)
-                          └── expose metrics on :8889 → scraped by Prometheus (:9090)
-                      Grafana (:3000) queries both Prometheus and Loki
+Claude Code clients ──OTLP (bearer-token auth)──▶ OTel Collector (4317 gRPC / 4318 HTTP)
+                                                     ├── push logs → Loki (:3100)
+                                                     └── expose metrics :8889 → scraped by Prometheus (:9090, 30s)
+                                                  Grafana (:3000) queries Prometheus + Loki
 ```
-Grafana has both datasources provisioned: Prometheus (uid `PBFA97CFB590B2093`, matching the dashboard panel references) and Loki (uid `loki`).
+Only 4317/4318 (ingest) and 3000 (Grafana) are published to the host; 8889/9090/3100
+are docker-network-internal only. All inter-service traffic uses service names.
 
-## Stack
-- **Orchestration:** Docker Compose
-- **Telemetry intake:** OpenTelemetry Collector (otel/opentelemetry-collector-contrib)
-- **Metrics storage:** Prometheus (scrapes collector on port 8889 every 30s)
-- **Log storage:** Loki (receives pushes via otlp_http from collector)
-- **Dashboard:** Grafana (auto-provisioned datasource + dashboard via JSON)
-- **Test data:** Python script using opentelemetry-sdk pushing via OTLP gRPC
+## Stack (docker compose, pinned by digest)
+- otel-collector `otel/opentelemetry-collector-contrib:0.156.0`
+- prometheus `prom/prometheus:v3.13.1` (retention 30d/10GB, admin API on)
+- loki `grafana/loki:3.7.3`
+- grafana `grafana/grafana:13.1.0`
 
-## File Structure
-```
-claude-code-telemetry/
-├── docker-compose.yml                          # Four-service stack with volumes, restart, depends_on
-├── otel-collector-config.yaml                  # OTLP receivers, batch processor, Prometheus + Loki exporters
-├── prometheus.yml                              # 30s scrape config targeting collector:8889
-├── test_telemetry.py                           # Continuous synthetic data generator (5 users, 5 metrics)
-├── provisioning/
-│   ├── datasources/datasources.yml             # Auto-configures Prometheus + Loki in Grafana
-│   └── dashboards/
-│       ├── dashboards.yml                      # Points Grafana to JSON dashboard files
-│       └── claude-code-analytics.json          # Auto-provisioned dashboard (5 panels)
-├── CLAUDE.md                                   # This file
-└── .gitignore                                  # Excludes .env
-```
+## Real Claude Code metrics (Prometheus names)
+| Metric | Notes |
+|--------|-------|
+| `claude_code_token_usage_tokens_total` | label `type` = input/output/cacheRead/cacheCreation |
+| `claude_code_session_count_total` | one series per `session_id` |
+| `claude_code_cost_usage_USD_total` | USD |
+| `claude_code_code_edit_tool_decision_total` | label `decision` = accept/reject |
+| `claude_code_active_time_seconds_total` | |
 
-## Metrics
-| Metric | Type | Description |
-|--------|------|-------------|
-| claude_code_tokens_used_total | Counter | Tokens consumed per user/model |
-| claude_code_sessions_total | Counter | Sessions initiated per user/model |
-| claude_code_estimated_cost_total | Counter | Cost at $3/million tokens |
-| claude_code_suggestions_accepted_total | Counter | Code suggestions accepted |
-| claude_code_suggestions_rejected_total | Counter | Code suggestions rejected |
+All carry a `user_email` label (identity comes from each person's Claude login,
+via the collector's `resource_to_telemetry_conversion`). Per-session series go
+**stale** after a session ends — dashboard panels use
+`last_over_time(<metric>[$__range])` so totals survive across ended sessions.
 
-All metrics carry labels: `user`, `model`
+## Dashboard panels (`provisioning/dashboards/claude-code-analytics.json`)
+1. **Token Use** (stat) — `sum by (user_email) (last_over_time(claude_code_token_usage_tokens_total[$__range]))`
+2. **Total Claude Sessions** (stat) — `...claude_code_session_count_total...`
+3. **Claude Cost** (gauge) — `...claude_code_cost_usage_USD_total...`
+4. **Code Acceptance** (gauge) — `...code_edit_tool_decision_total{decision="accept"}...`
+5. **Code Rejection** (gauge) — `...code_edit_tool_decision_total{decision="reject"}...`
 
-## Dashboard Panels
-1. **Token Use** (stat) — `claude_code_tokens_used_total` by user
-2. **Total Claude Sessions** (stat) — `claude_code_sessions_total` by user
-3. **Claude Cost** (gauge) — `claude_code_estimated_cost_total` by user
-4. **Suggestions Accepted** (stat) — `claude_code_suggestions_accepted_total` by user
-5. **Acceptance Rate** (gauge, %) — accepted / (accepted + rejected) by user
+Set the dashboard time range (default `now-6h`) wide enough to cover recent
+activity, or panels read empty.
 
-> Stat panels reduce with `lastNotNull` on cumulative counters, so they show running totals. Switch to `rate()`/`increase()` if per-interval usage is wanted.
+## Security / auth
+- OTLP receivers require `Authorization: Bearer <OTEL_INGEST_TOKEN>` (401 otherwise).
+- Secrets (`GRAFANA_ADMIN_PASSWORD`, `OTEL_INGEST_TOKEN`) live in a gitignored
+  `.env` on the VM; compose requires them (`:?`) so it never boots insecurely.
+- Grafana admin password: set once via env on volume init, then rotate with
+  `docker compose exec grafana grafana cli admin reset-admin-password <new>`.
+- Security group `sg-0c10615c3983e2f47` is an IP allowlist managed by
+  `update-sg.sh` (operator IP on all ports; `team-ips.txt` entries on 4317/4318).
+
+## Self-contained operation
+- `cron-telemetry.sh` (hourly cron on the VM) runs a small real Claude session
+  that also makes a changing edit under `acceptEdits`, keeping all panels fresh
+  with no external client.
+- `telemetry-stack.service` (systemd) + `restart: unless-stopped` + enabled
+  docker/cron ⇒ the stack and data generation self-recover on reboot/crash.
+- Named volumes (`prometheus_data`, `loki_data`, `grafana_data`) persist data.
 
 ## Deployment
-- **VM:** EC2 t3.small, Ubuntu 24.04, us-east-1
-- **Public IP:** 18.215.170.79
+- **VM:** EC2 `i-0aec393b021b5ef2c`, Ubuntu 24.04, us-east-1, `18.215.170.79`
 - **Grafana:** http://18.215.170.79:3000
 - **Repo:** https://github.com/bszczurko-sudo/claude-code-telemetry
+- Full runbook: **DEPLOY.md** · Handoff status: **STATUS.md**
 
-## Key Decisions
-- Push model (OTLP) for Claude Code → Collector, pull model (scrape) for Collector → Prometheus
-- `otlp_http/loki` exporter (not deprecated `loki` or `otlphttp`)
-- Grafana provisioning via mounted files, not manual UI config
-- Named Docker volumes for persistence across restarts
-- `restart: unless-stopped` on all services
+## Onboarding a client
+`./bootstrap-claude-telemetry.sh <OTEL_INGEST_TOKEN> [http://<VM_IP>:4317]` merges
+the telemetry `env` block (incl. the bearer header) into `~/.claude/settings.json`.
+Remote clients also need their IP in `team-ips.txt` + `./update-sg.sh`.
 
-## Coding Standards
-- Python 3.14 on macOS, Python 3.x on Ubuntu VM
-- OpenTelemetry SDK for all metric/log pushing
-- Counters only (no Gauges yet) — add() is the only method
-- YAML configs: always validate spelling (receivers not recievers), no duplicate keys
-- Dashboard changes: edit in Grafana UI, export JSON, replace provisioning file
+## Files
+```
+docker-compose.yml              four-service stack, pinned images, secrets via .env
+otel-collector-config.yaml      OTLP (bearer auth) → Prometheus + Loki
+prometheus.yml                  30s scrape of collector:8889
+provisioning/                   Grafana datasources + dashboard JSON
+update-sg.sh + team-ips.txt     SG allowlist reconcile
+bootstrap-claude-telemetry.sh   point a client at the collector
+cron-telemetry.sh               hourly real-data heartbeat
+telemetry-stack.service         systemd boot unit
+test_telemetry.py               synthetic generator (smoke-test only; *.invalid users)
+```
 
 ## Jira
-- Ticket: OPS-235 (parent: OPS-8)
-- Assignee: Brett Szczurko
-- Stakeholders: Joseph Lancaster (analytics), Don Dewar (ticket creator), Huseyin Esin (AWS/VM)
+- Ticket: OPS-235 (parent: OPS-8) · Assignee: Brett Szczurko
+- Stakeholders: Joseph Lancaster (analytics), Don Dewar (creator), Huseyin Esin (AWS/VM)
 
-## What's Left
-- Connect real Claude Code clients (env vars on dev machines)
-- Publish Confluence runbook (currently draft)
-- Transfer repo to edgebeamwireless GitHub org
-- Replace placeholder Grafana password
-
+## Remaining / follow-ups
+- Security triage Phase 2/3 (TLS, resource limits, container hardening,
+  IMDSv2, per-client tokens, privacy/retention, IAM scoping, netseg).
+- Transfer repo to the edgebeamwireless GitHub org.
+- Publish the Confluence runbook.

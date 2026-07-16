@@ -19,14 +19,9 @@ cp .env.example .env && chmod 600 .env
 #   GRAFANA_ADMIN_PASSWORD=<strong value>
 #   OTEL_INGEST_TOKEN=$(openssl rand -hex 32)   # shared telemetry-push token
 ```
-`docker-compose.yml` reads `${GRAFANA_ADMIN_PASSWORD}` and requires
-`${OTEL_INGEST_TOKEN:?}` (the collector refuses to start without it, so auth is
-never silently disabled).
-
-> There is also an optional Bitwarden Secrets Manager path (`deploy.sh` +
-> `.bws.env`) if you'd rather pull secrets from `bws` at deploy time instead of
-> keeping them in `.env`. It expects the var named `GF_SECURITY_ADMIN_PASSWORD`;
-> reconcile that with the `.env` approach before using it.
+`docker-compose.yml` requires both `${GRAFANA_ADMIN_PASSWORD:?}` and
+`${OTEL_INGEST_TOKEN:?}` — the stack refuses to start if either is unset, so it
+never boots with a blank Grafana password or auth disabled.
 
 ## Deploy
 ```bash
@@ -34,8 +29,9 @@ cd ~/claude-code-telemetry
 git pull
 docker compose up -d
 ```
-Grafana applies `GF_SECURITY_ADMIN_PASSWORD` on every start, so editing `.env`
-and re-running `docker compose up -d` resets the admin password.
+Note: Grafana only reads `GF_SECURITY_ADMIN_PASSWORD` on **first** volume init.
+To rotate the admin password later, edit `.env` **and** run:
+`docker compose exec grafana grafana cli admin reset-admin-password <new>`.
 
 ---
 

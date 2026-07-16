@@ -1,119 +1,43 @@
 # OPS-235 Telemetry Stack — Status & Handoff
 
-_Last updated: 2026-07-15 — handoff for Joe_
+_Last updated: 2026-07-16 — handoff for Joseph Lancaster_
 
 ## TL;DR
-Real Claude Code telemetry is flowing into the VM (previously it was only
-synthetic data from `test_telemetry.py`). The stack is healthy, and the Grafana
-dashboard has been **repointed to the real metric names and now renders real
-data** (verified end-to-end through the Grafana datasource proxy). Remaining work
-is mostly codifying config into the repo — see "Remaining work" below.
+The stack is live on the VM, self-contained, and shows **real** Claude Code
+telemetry. Security triage **Phase 1** is complete. Phase 2/3 remain (file as
+tickets). The repo is the source of truth; the VM tracks `origin/main`.
 
 ## Environment
-- **VM**: `ubuntu@18.215.170.79` (EC2 `i-0aec393b021b5ef2c`, `ops-claude-code-telemetry`, us-east-1)
-  - SSH key: `~/.ssh/ops-telemetry-key.pem`
-  - Security group `sg-0c10615c3983e2f47` (ports 22/3000/4317/4318) is locked to a single
-    operator IP. It rotates on cellular; refresh with `./update-sg.sh` before connecting.
-- **Stack** (docker compose in `~/claude-code-telemetry` on the VM):
-  - otel-collector (OTLP gRPC 4317 / HTTP 4318, Prometheus exporter :8889)
-  - prometheus (:9090) · grafana (:3000) · loki (:3100)
-  - Grafana UI: http://18.215.170.79:3000
+- **VM:** `ubuntu@18.215.170.79` (EC2 `i-0aec393b021b5ef2c`, us-east-1), key `~/.ssh/ops-telemetry-key.pem`
+- **Grafana:** http://18.215.170.79:3000  (admin password in the VM's `.env`)
+- **Stack** (`~/claude-code-telemetry`, docker compose): otel-collector, prometheus, loki, grafana
+- **SG** `sg-0c10615c3983e2f47`: IP allowlist via `./update-sg.sh` (operator all-ports; `team-ips.txt` on 4317/4318). Operator IP rotates on cellular — re-run before connecting.
 
 ## What works
-- All four containers up and healthy.
-- OTLP receiver accepting data on 4317/4318.
-- Prometheus scraping the collector; Grafana provisioned with the Prometheus + Loki datasources.
-- **Real** Claude Code telemetry confirmed arriving (see snapshot below).
+- All four containers healthy; images pinned by digest; survives reboot (systemd unit + `unless-stopped`, verified by an actual reboot).
+- OTLP ingest requires a bearer token; unauthenticated push → 401.
+- Real telemetry flowing; dashboard renders all 5 panels (Token Use, Sessions, Cost, Code Acceptance, Code Rejection), keyed by `user_email`.
+- **Self-contained data:** hourly `cron-telemetry.sh` runs a real session (with an accepted edit) so every panel stays populated with no external client.
 
-## What I changed this session
-1. Configured real telemetry on the VM in `~/.claude/settings.json` (`env` block):
-   `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_METRICS_EXPORTER=otlp`,
-   `OTEL_LOGS_EXPORTER=otlp`, `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`,
-   `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`, plus short export intervals.
-   (Backup at `~/.claude/settings.json.bak`.) **Not yet captured in this repo.**
-2. Ran 3 real headless Claude Code sessions on the VM to emit genuine metrics.
-3. Verified real metric families now exist in Prometheus.
+## Security triage — Phase 1 (DONE)
+1. **Grafana CVE-2026-27876** — running 13.1.0, above the 11.6–12.4 range → not vulnerable.
+2. **Images pinned** to version + `@sha256` digest (grafana 13.1.0, prometheus v3.13.1, loki 3.7.3, otel-collector 0.156.0).
+3. **Internal ports closed** — 9090/3100/8889 no longer published to the host (docker-network only); only 4317/4318 + 3000 are exposed.
+4. **Grafana password fail-safe** — `${GRAFANA_ADMIN_PASSWORD:?}`; strong password set on the VM (`admin/admin` fallback and the `<from-secrets-manager>` placeholder are gone).
+5. **Test data cleaned** — `test_telemetry.py` uses `*.invalid` emails + `synthetic=true`.
 
-## Real-data snapshot (from the 3 sessions)
-| Metric | Value |
-|---|---|
-| `claude_code_session_count_total` | 3 sessions |
-| `claude_code_token_usage_tokens_total` | 69,504 (input 1,614 / output 342 / cacheRead 60,504 / cacheCreation 7,044) |
-| `claude_code_cost_usage_USD_total` | $0.10978 |
-| `claude_code_active_time_seconds_total` | 8.4s |
-| user label | `user_email="bszczurko@edgebeamwireless.com"` |
+## Key gotchas for whoever runs this
+- **Dashboard time range:** per-session metrics go stale; panels use `last_over_time([$__range])`. Keep the range ≥ a few hours (default `now-6h`) or panels read empty.
+- **Scrape latency ~30–40s** (10s client export + 30s Prometheus scrape).
+- **Grafana password rotation:** Grafana only reads the env var on first volume init. To change it: edit `.env` **and** run `docker compose exec grafana grafana cli admin reset-admin-password <new>`.
+- **Debugging internal ports:** now that 9090/3100/8889 aren't on the host, use `docker compose exec <svc> ...`.
+- **Secrets:** `.env` (VM only, gitignored) holds `GRAFANA_ADMIN_PASSWORD` + `OTEL_INGEST_TOKEN`. Not in git.
 
-## ✅ Fixed this session (dashboard now renders real data)
-All five panels in `provisioning/dashboards/claude-code-analytics.json` were
-repointed from the synthetic metric names to the real Claude Code metrics, and
-legends changed from `{{user}}` to `{{user_email}}`:
+## Remaining work (Phase 2 / 3 — file as OPS-235 sub-tickets)
+- **Phase 2:** TLS/encrypted transport; resource limits + collector `memory_limiter`; container hardening (`no-new-privileges`, `cap_drop`, read-only, non-root); `update-sg.sh` safety hardening (CIDR validation, reject `/0`, authorize-before-revoke, IPv6, sts identity check); enforce IMDSv2 (IMDSv1 currently reachable).
+- **Phase 3:** per-client tokens/mTLS; privacy & retention (hash/drop emails+session IDs, Loki retention, EBS encryption, data-owner docs); scope IAM for the SG script; network segmentation (frontend/ingestion/backend docker networks).
+- Transfer repo to the edgebeamwireless GitHub org; publish the Confluence runbook.
 
-| Panel | New query |
-|---|---|
-| Token Use | `sum by (user_email) (last_over_time(claude_code_token_usage_tokens_total[$__range]))` |
-| Total Claude Sessions | `sum by (user_email) (last_over_time(claude_code_session_count_total[$__range]))` |
-| Claude Cost | `sum by (user_email) (last_over_time(claude_code_cost_usage_USD_total[$__range]))` |
-| Code Acceptance | `sum by (user_email) (last_over_time(claude_code_code_edit_tool_decision_total{decision="accept"}[$__range]))` |
-| Code Rejection | `sum by (user_email) (last_over_time(claude_code_code_edit_tool_decision_total{decision="reject"}[$__range]))` |
-
-**Why `last_over_time(...[$__range])` and not a plain `sum`:** real Claude Code
-tags every metric with a unique `session_id`, so each session is its own series.
-When a session ends, its series stops updating and goes stale — a plain
-`sum by (user_email)` instant query then only counts *currently-running* sessions
-(reads ~0 when nobody is active). `last_over_time(...[$__range])` grabs each
-session's final value across the panel's selected time range, so the stat/gauge
-panels total correctly across ended sessions. **Implication for Joe:** set the
-dashboard time range wide enough to cover the activity you want to see (e.g. 24h);
-a range shorter than the gap since last activity will read empty.
-
-Verified end-to-end via the Grafana datasource proxy — Token Use / Sessions /
-Cost / Acceptance all return real values; Rejection is legitimately empty until a
-real reject happens.
-
-## Operational notes
-- **Scrape latency ~30–40s.** Metrics export every 10s (collector) but Prometheus
-  scrapes every 30s, so fresh activity takes up to ~40s to appear. Don't panic if a
-  brand-new session isn't on the dashboard for a few seconds.
-- **Grafana admin password** in `docker-compose.yml` is the literal placeholder
-  `<from-secrets-manager>` — never wired to a real secret. Works today but should be
-  fixed.
-
-## ✅ Config codified + secret moved to Bitwarden (this session)
-The repo is now the source of truth; the VM was reset to `origin/main` (clean).
-- Pulled the VM's uncommitted working state into git: `datasources.yml` (adds Loki +
-  pins Prometheus uid `PBFA97CFB590B2093`), `otel-collector-config.yaml` (exporter
-  tweaks), `test_telemetry.py` (real metric names), and `CLAUDE.md`.
-- Grafana admin password no longer hardcoded. `docker-compose.yml` reads
-  `${GF_SECURITY_ADMIN_PASSWORD:?}`; `deploy.sh` injects it from **Bitwarden Secrets
-  Manager** (`bws`). Telemetry client config is codified in
-  `claude-code-telemetry-settings.json` + `bootstrap-claude-telemetry.sh`.
-- Full runbook in **DEPLOY.md**.
-
-### ⚠️ One manual step before the next VM deploy
-The stack is still *running* with the old password, but `docker compose` on the VM
-now requires the secret. Before the next `./deploy.sh`, someone with Bitwarden
-Secrets Manager access must (see DEPLOY.md §1–3): create the `bws` secret + machine
-account token, install `bws` on the VM, and create `~/claude-code-telemetry/.bws.env`.
-(Until then, inspect containers with `docker ps`, not `docker compose ps`.)
-
-## Remaining work
-1. ~~Populate the Rejection panel~~ **Done** — drove a real denied edit (temporary
-   `PreToolUse` deny hook on the VM) so `claude_code_code_edit_tool_decision_total{decision="reject"}`
-   = 1. All five panels now have real data. The hook was removed afterward.
-2. **Retire the synthetic generator** (`test_telemetry.py`) — optional; it now emits
-   real metric names and is handy for smoke-testing an empty stack.
-3. **Scrape latency / secret rotation** — minor ops items noted above.
-
-## How to reproduce / drive more real data
-```bash
-./update-sg.sh                                   # refresh SG to your current IP
-ssh -i ~/.ssh/ops-telemetry-key.pem ubuntu@18.215.170.79
-# on the VM (telemetry already configured in ~/.claude/settings.json):
-~/.local/bin/claude -p "summarize this repo" --output-format text
-# check Prometheus:
-curl -s http://localhost:9090/api/v1/label/__name__/values | jq -r '.data[]' | grep claude
-```
-
-## Decommission note
-`test_telemetry.py` (synthetic generator) can be retired once the dashboard is
-pointed at the real metric names — keep it around only for smoke-testing an empty stack.
+## Deploy / onboarding
+See **DEPLOY.md** (secrets, deploy, client onboarding, reboot recovery). Repo:
+https://github.com/bszczurko-sudo/claude-code-telemetry
