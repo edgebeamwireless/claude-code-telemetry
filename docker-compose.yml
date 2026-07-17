@@ -4,6 +4,7 @@ services:
 # and routes metrics to Prometheus and logs to Loki
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.156.0@sha256:125bdbeb7590cc1952c5b3430ecf14063568980c2c93d5b38676cc0446ed8108
+    user: "10001"
     command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
@@ -26,7 +27,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 256M
           cpus: '0.5'
     networks:
       - ingestion
@@ -48,7 +49,6 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - --web.enable-admin-api
       - --storage.tsdb.retention.time=30d
       - --storage.tsdb.retention.size=10GB
     security_opt:
@@ -70,6 +70,7 @@ services:
 # Grafana queries Loki to visualize this data
   loki:
     image: grafana/loki:3.7.3@sha256:70b9f699fc9bb868b62f1cfd4f787dfa50242f1fd92e6089787d5d7daea75fe8
+    user: "10001"
     # Reached by the collector (push) and Grafana (query) over the docker
     # network; NOT published to the host.
     volumes:
@@ -114,7 +115,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 256M
           cpus: '0.5'
     networks:
       - frontend

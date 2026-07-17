@@ -125,6 +125,7 @@ for PORT in "${PORTS[@]}"; do
     while read -r cidr; do
         [[ -z "$cidr" ]] && continue
         d="$(printf '%s\n' "$DESIRED" | awk -F'\t' -v c="$cidr" '$1==c{print $2; exit}')"
+        d="${d//\"/}"   # strip double quotes so they can't break the --ip-permissions string
         if $DRY_RUN; then echo "  [$PORT] + would authorize $cidr ($d)"; continue; fi
         aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --region "$REGION" \
             --ip-permissions "IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,IpRanges=[{CidrIp=$cidr,Description=\"$d\"}]" >/dev/null
@@ -147,6 +148,7 @@ for PORT in "${PORTS[@]}"; do
     while read -r cidr; do
         [[ -z "$cidr" ]] && continue
         d="$(printf '%s' "$CURRENT_JSON" | jq -r --arg c "$cidr" '.[]|select(.CidrIp==$c)|.Description // ""' | head -1)"
+        d="${d//\"/}"   # strip double quotes so they can't break the --ip-permissions string
         if $DRY_RUN; then echo "  [$PORT] - would revoke $cidr"; continue; fi
         aws ec2 revoke-security-group-ingress --group-id "$SG_ID" --region "$REGION" \
             --ip-permissions "IpProtocol=tcp,FromPort=$PORT,ToPort=$PORT,IpRanges=[{CidrIp=$cidr,Description=\"$d\"}]" >/dev/null

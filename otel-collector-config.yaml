@@ -22,13 +22,13 @@ processors:
   # collector can OOM its 512M container limit.
   memory_limiter:
     check_interval: 5s
-    limit_mib: 400
-    spike_limit_mib: 100
+    limit_mib: 150
+    spike_limit_mib: 50
   # Privacy (OPS-408): replace the raw user.email resource attribute with the
   # first 12 chars of its SHA256 hash before anything is stored. Users stay
   # distinguishable (stable per-email hash) but the raw address isn't retained.
   transform/hashemail:
-    error_mode: ignore
+    error_mode: propagate
     # user.email arrives as a DATAPOINT attribute (metrics) / log-record attribute
     # (logs) — the Prometheus exporter turns those into labels directly.
     metric_statements:
